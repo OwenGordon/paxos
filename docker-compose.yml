@@ -28,6 +28,13 @@ services:
     networks:
       - db-node-network
 
+  log-app:
+    image: log-server-app:latest
+    ports:
+      - "8000:8000"
+    networks:
+      - db-node-network
+
 networks:
   db-node-network:
     external: true
