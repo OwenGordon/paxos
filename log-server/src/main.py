@@ -61,3 +61,11 @@ async def read_items(db = Depends(get_db)):
     raw_items: list[DBItem] = db.query(DBItem).all()
     logs = [LogResponse(timestamp=item.timestamp, source=item.source, action=item.action, destination=item.destination, id=item.id) for item in raw_items]
     return logs
+
+@app.delete("/logs/")
+async def delete_logs(db = Depends(get_db)):
+    raw_items: list[DBItem] = db.query(DBItem).all()
+    for item in raw_items:
+        db.delete(item)
+    db.commit()
+    return {"message": "Logs deleted successfully"}
