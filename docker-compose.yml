@@ -1,0 +1,32 @@
+services:
+  db-node-app:
+    image: db-node-app:latest
+    ports:
+      - "6969:6969"
+    networks:
+      - db-node-network
+    environment:
+      REDIS_URL: redis://localhost:6379
+      RUST_LOG: info
+      MASTER_URL: http://master-app:3000
+    deploy:
+      replicas: 3
+    depends_on:
+      - master-app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6969/swarm-check"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  master-app:
+    image: master-node-app:latest
+    ports:
+      - "3000:3000"
+    networks:
+      - db-node-network
+
+networks:
+  db-node-network:
+    external: true
