@@ -9,6 +9,7 @@ services:
       REDIS_URL: redis://localhost:6379
       RUST_LOG: info
       MASTER_URL: http://master-app:3000
+      DELAY: 2
     deploy:
       replicas: 3
     depends_on:
