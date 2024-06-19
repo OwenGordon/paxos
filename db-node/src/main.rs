@@ -16,6 +16,7 @@ use reqwest;
 use reqwest::{Response, Error};
 
 use std::str::FromStr;
+use chrono;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ConsistencyModel {
@@ -43,10 +44,36 @@ struct Pair {
     value: String,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+struct Broadcast {
+    node: String,
+    key: String,
+    value: String
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 struct ClientInfo {
     id: String,
     addr: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LogInfo {
+    timestamp: String,
+    source: String,
+    destination: String,
+    action: String
+}
+
+impl LogInfo {
+    pub fn new(source: String, destination: String, action: String) -> LogInfo {
+        LogInfo {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source,
+            destination,
+            action,
+        }
+    }
 }
 
 fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, cluster_addrs: Arc<RwLock<Vec<ClientInfo>>>) -> Vec<impl Future<Output = Result<Response, Error>>> {
@@ -69,6 +96,7 @@ fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, 
             reqwest::Client::new()
                 .post(format!("http://{}:6969/update", client_info.addr))
                 .json(&json!({
+                    "node": node_id_clone,
                     "key": params_clone.key,
                     "value": value
                 }))
@@ -81,10 +109,25 @@ fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, 
     return tasks;
 }
 
+
+fn push_log(log_record: LogInfo, log_server_url: &str) -> Result<(), reqwest::Error> {
+    let client = reqwest::blocking::Client::new();
+    let json = serde_json::to_string(&log_record).expect("Failed to serialize log data");
+
+    let _ = client.post(log_server_url)
+        .header("Content-Type", "application/json")
+        .body(json)
+        .send()?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let master_url: String = env::var("MASTER_URL").expect("MASTER_URL must be set");
+
+    let log_server: String = env::var("LOG_SERVER_URL").expect("LOG_SERVER_URL must be set");
 
     let delay: u64 = env::var("DELAY").expect("DELAY must be set").parse().unwrap();
 
@@ -104,6 +147,8 @@ async fn main() {
         .await
         .expect("Failed to get node ID");
 
+    let node_id: String = node_id.clone().to_string().replace("\"", "");
+
     info!("Node registered with ID: {}", node_id);
 
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL must be set");
@@ -116,22 +161,38 @@ async fn main() {
 
     let cluster_addrs_clone = cluster_addrs.clone();
 
+    let node_id_clone = node_id.clone();
+
+    let log_server_clone = log_server.clone();
+
     let set = warp::post()
         .and(warp::path("set"))
-        .and(warp::header("consistency-model"))
+        .and(warp::header("Consistency-Model"))
+        .and(warp::header("Client-Id"))
         .and(warp::body::json())
         .and(client_filter.clone())
-        .and_then(move |consistency_model: ConsistencyModel, payload: Pair, client: redis::Client| {
+        .and_then(move |consistency_model: ConsistencyModel, client_id: String, payload: Pair, client: redis::Client| {
             let cluster_addrs = cluster_addrs_clone.clone();
-            let node_id_clone: String = node_id.clone().to_string().replace("\"", "");
+            let node_id_clone = node_id_clone.clone();
+            let client_id_clone = client_id.clone();
+            let log_server_clone = log_server_clone.clone();
             async move {
                 let mut con = client.get_connection().expect("Failed to connect to Redis");
 
                 let _: () = con.set(&payload.key, &payload.value).expect("Failed to set key in Redis");
 
-                info!("Node {}: key {} = {}", node_id_clone, payload.key, payload.value);
+                info!("Node {}: set key {} = {}", node_id_clone, payload.key, payload.value);
 
-                let duration = time::Duration::from_millis(delay * 1000);
+                // Create a log record for the update operation
+                let log_record = LogInfo::new(
+                    format!("client-{}", client_id_clone),
+                    format!("node-{}", node_id_clone),
+                    format!("Client Set key: {}, value: {}", payload.key, payload.value)
+                );
+
+                let _ = push_log(log_record, &log_server_clone);
+
+                let duration = time::Duration::from_millis(delay * 0);
                 thread::sleep(duration);
 
                 match consistency_model {
@@ -165,28 +226,55 @@ async fn main() {
             }
         });
 
+    let node_id_clone = node_id.clone();
+    let log_server_clone = log_server.clone();
+
     let update = warp::post()
         .and(warp::path("update"))
         .and(warp::body::json())
         .and(client_filter.clone())
-        .map(move |params: Pair, client: redis::Client| {
+        .map(move |payload: Broadcast, client: redis::Client| {
             let mut con = client.get_connection().expect("Failed to connect to Redis");
 
-            let _: () = con.set(&params.key, &params.value).expect("Failed to set key in Redis");
+            let _: () = con.set(&payload.key, &payload.value).expect("Failed to set key in Redis");
 
-            info!("key {} = {}", params.key, params.value);
+            info!("Node {}: update key {} = {}", node_id_clone.clone(), payload.key, payload.value);
+
+            // Create a log record for the update operation
+            let log_record = LogInfo::new(
+                format!("node-{}", payload.node.clone()),
+                format!("node-{}", node_id_clone.clone()),
+                format!("Broadcast Set key: {}, value: {}", payload.key, payload.value)
+            );
+
+            let _ = push_log(log_record, &log_server_clone.clone());
 
             warp::reply::with_status("Key set", StatusCode::OK)
         });
 
+    let node_id_clone = node_id.clone();
+    let log_server_clone = log_server.clone();
+
     let get = warp::get()
         .and(warp::path("get"))
+        .and(warp::header("Client-Id"))
         .and(warp::path::param())
         .and(client_filter.clone()) // Clone the client filter for use in this route
-        .map(|key: String, client: redis::Client| {
+        .map(move |client_id: String, key: String, client: redis::Client| {
             let mut con = client.get_connection().expect("failed to connect to Redis");
             match con.get(&key) {
-                Ok(result) => warp::reply::with_status(warp::reply::json::<String>(&result), StatusCode::OK),
+                Ok(value) => {
+                    // Create a log record for the update operation
+                    let log_record = LogInfo::new(
+                        format!("client-{}", client_id.clone()),
+                        format!("node-{}", node_id_clone.clone()),
+                        format!("Client Got key: {}, value: {}", key, value)
+                    );
+
+                    let _ = push_log(log_record, &log_server_clone.clone());
+
+                    warp::reply::with_status(warp::reply::json::<String>(&value), StatusCode::OK)
+                }
                 Err(_) => warp::reply::with_status(warp::reply::json(&"key not found"), StatusCode::NOT_FOUND)
             }
         });
