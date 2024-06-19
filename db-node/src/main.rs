@@ -9,8 +9,33 @@ use env_logger::Env;
 
 use log::info;
 use std::sync::{Arc, RwLock};
+use std::{thread, time};
+use futures::Future;
 
 use reqwest;
+use reqwest::{Response, Error};
+
+use std::str::FromStr;
+
+#[derive(Serialize, Deserialize, Debug)]
+enum ConsistencyModel {
+    Strong,
+    Eventual,
+    Causal,
+}
+
+impl FromStr for ConsistencyModel {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "strong" => Ok(ConsistencyModel::Strong),
+            "eventual" => Ok(ConsistencyModel::Eventual),
+            "causal" => Ok(ConsistencyModel::Causal),
+            _ => Ok(ConsistencyModel::Eventual),
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Pair {
@@ -24,10 +49,44 @@ struct ClientInfo {
     addr: String,
 }
 
+fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, cluster_addrs: Arc<RwLock<Vec<ClientInfo>>>) -> Vec<impl Future<Output = Result<Response, Error>>> {
+    // broadcast
+    let tasks: Vec<_> = <Vec<ClientInfo> as Clone>::clone(&cluster_addrs.read().unwrap())
+    .into_iter()
+    .filter(|client_info| {
+        let client_id_str = client_info.id.to_string();
+        let is_same = client_id_str == node_id_clone;
+        !is_same
+    })
+    .map(|client_info| {
+        let params_clone = payload.clone();
+        let node_id_clone =  node_id_clone.clone();
+        let client_clone = client.clone();
+        async move {
+            let mut con = client_clone.get_connection().expect("Failed to connect to redis");
+            let value: String = con.get(&params_clone.key).unwrap();
+            info!("Node {} Sending redis update to {:?}", node_id_clone, client_info);
+            reqwest::Client::new()
+                .post(format!("http://{}:6969/update", client_info.addr))
+                .json(&json!({
+                    "key": params_clone.key,
+                    "value": value
+                }))
+                .send()
+                .await
+        }
+    })
+    .collect();
+
+    return tasks;
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let master_url: String = env::var("MASTER_URL").expect("MASTER_URL must be set");
+
+    let delay: u64 = env::var("DELAY").expect("DELAY must be set").parse().unwrap();
 
     let local_ip = local_ip().unwrap();
 
@@ -59,43 +118,48 @@ async fn main() {
 
     let set = warp::post()
         .and(warp::path("set"))
+        .and(warp::header("consistency-model"))
         .and(warp::body::json())
         .and(client_filter.clone())
-        .and_then(move |params: Pair, client: redis::Client| {
+        .and_then(move |consistency_model: ConsistencyModel, payload: Pair, client: redis::Client| {
             let cluster_addrs = cluster_addrs_clone.clone();
             let node_id_clone: String = node_id.clone().to_string().replace("\"", "");
             async move {
                 let mut con = client.get_connection().expect("Failed to connect to Redis");
 
-                let _: () = con.set(&params.key, &params.value).expect("Failed to set key in Redis");
+                let _: () = con.set(&payload.key, &payload.value).expect("Failed to set key in Redis");
 
-                info!("Node {}: key {} = {}", node_id_clone, params.key, params.value);
+                info!("Node {}: key {} = {}", node_id_clone, payload.key, payload.value);
 
-                let tasks: Vec<_> = <Vec<ClientInfo> as Clone>::clone(&cluster_addrs.read().unwrap())
-                    .into_iter()
-                    .filter(|client_info| {
-                        let client_id_str = client_info.id.to_string();
-                        let is_same = client_id_str == node_id_clone;
-                        !is_same
-                    })
-                    .map(|client_info| {
-                        let params_clone = params.clone();
-                        let node_id_clone =  node_id_clone.clone();
-                        async move {
-                            info!("I am: id={}, addr={}, Sending redis update to {:?}", node_id_clone, local_ip, client_info);
-                            reqwest::Client::new()
-                                .post(format!("http://{}:6969/update", client_info.addr))
-                                .json(&json!({
-                                    "key": params_clone.key,
-                                    "value": params_clone.value
-                                }))
-                                .send()
-                                .await
-                        }
-                    })
-                    .collect();
+                let duration = time::Duration::from_millis(delay * 1000);
+                thread::sleep(duration);
 
-                futures::future::join_all(tasks).await;
+                match consistency_model {
+                    ConsistencyModel::Strong => {
+                        // For strong consistency, ensure all nodes are updated before responding
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        futures::future::join_all(tasks).await;
+                        info!("Strong consistency: All nodes updated.");
+                    },
+                    ConsistencyModel::Eventual => {
+                        // For eventual consistency, respond immediately and update in the background
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        tokio::spawn(async move {
+                            futures::future::join_all(tasks).await;
+                            info!("Eventual consistency: Nodes update initiated.");
+                        });
+                    },
+                    ConsistencyModel::Causal => {
+                        // For causal consistency, updates depend on the causality chain, which might need custom logic
+                        // Here, we just simulate a simple broadcast for demonstration
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        futures::future::join_all(tasks).await;
+                        info!("Causal consistency: Causally ordered updates completed.");
+                    },
+                }
+
+                // let tasks = total_broadcast(node_id_clone.clone(), payload, client, cluster_addrs);
+                // futures::future::join_all(tasks).await;
 
                 Ok::<_, warp::Rejection>(warp::reply::with_status("Key set", StatusCode::OK))
             }

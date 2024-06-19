@@ -2,3 +2,4 @@ scratch
 .idea
 target
 Cargo.lock
+.venv

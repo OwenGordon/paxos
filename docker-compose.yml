@@ -11,7 +11,7 @@ services:
       MASTER_URL: http://master-app:3000
       DELAY: 2
     deploy:
-      replicas: 3
+      replicas: 2
     depends_on:
       - master-app
     healthcheck:
