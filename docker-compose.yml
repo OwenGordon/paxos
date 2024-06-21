@@ -29,12 +29,27 @@ services:
     networks:
       - db-node-network
 
+  
+  log-db:
+    image: log-db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ./log-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    
   log-app:
     image: log-server-app:latest
     ports:
       - "8000:8000"
     networks:
       - db-node-network
+    depends_on:
+      - log-db
+    environment:
+      DATABASE_URL: postgres://user:password@db:5432/logs
 
 networks:
   db-node-network:
