@@ -1,20 +1,14 @@
-# Use the official Python image from the Docker Hub
-FROM python:3.10
+FROM rust:latest
 
-# Set the working directory in the container
-WORKDIR /app
+RUN apt-get update && apt-get install -y redis-server dnsutils net-tools
 
-# Copy the requirements file into the container
-COPY requirements.txt .
+WORKDIR /usr/src/myapp
 
-# Install the dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
 
-# Copy the rest of the application code into the container
-COPY src/ .
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Expose the port the app runs on
-EXPOSE 8000
+RUN cargo build --release
 
-# Command to run the FastAPI app with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["entrypoint.sh"]
