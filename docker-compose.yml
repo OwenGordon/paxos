@@ -10,20 +10,22 @@ services:
       RUST_LOG: info
       MASTER_URL: http://master-app:3000
       LOG_SERVER_URL: http://log-app:8000/log/
-      DELAY: 2
+      DELAY: 200
     deploy:
       replicas: 2
     depends_on:
       - master-app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6969/swarm-check"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
-      start_period: 15s
+      start_period: 6s
 
   master-app:
     image: master-node-app:latest
+    environment:
+      INTERVAL: 5
     ports:
       - "3000:3000"
     networks:
@@ -35,6 +37,17 @@ services:
       - "8000:8000"
     networks:
       - db-node-network
+
+  visualization-app:
+    image: visualization-app:latest
+    environment:
+      - LOG_SERVER_URL=http://log-app:8000/logs/
+    ports: 
+      - "8080:8080"
+    networks:
+      - db-node-network
+    volumes:
+      - ./visualization/plot.js:/app/plot.js:ro
 
 networks:
   db-node-network:

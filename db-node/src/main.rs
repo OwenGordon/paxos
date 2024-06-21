@@ -17,6 +17,7 @@ use reqwest::{Response, Error};
 
 use std::str::FromStr;
 use chrono;
+use uuid;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ConsistencyModel {
@@ -60,23 +61,25 @@ struct ClientInfo {
 #[derive(Deserialize, Serialize)]
 struct LogInfo {
     timestamp: String,
-    source: String,
-    destination: String,
+    sender: String,
+    receiver: String,
+    message_id: String,
     action: String
 }
 
 impl LogInfo {
-    pub fn new(source: String, destination: String, action: String) -> LogInfo {
+    pub fn new(sender: String, receiver: String, action: String, message_id: String) -> LogInfo {
         LogInfo {
             timestamp: chrono::Utc::now().to_rfc3339(),
-            source,
-            destination,
+            sender,
+            receiver,
+            message_id,
             action,
         }
     }
 }
 
-fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, cluster_addrs: Arc<RwLock<Vec<ClientInfo>>>) -> Vec<impl Future<Output = Result<Response, Error>>> {
+fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, cluster_addrs: Arc<RwLock<Vec<ClientInfo>>>, log_server_url: String) -> Vec<impl Future<Output = Result<Response, Error>> + 'static> {
     // broadcast
     let tasks: Vec<_> = <Vec<ClientInfo> as Clone>::clone(&cluster_addrs.read().unwrap())
     .into_iter()
@@ -89,19 +92,64 @@ fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, 
         let params_clone = payload.clone();
         let node_id_clone =  node_id_clone.clone();
         let client_clone = client.clone();
+        let log_server_clone = log_server_url.clone();
         async move {
             let mut con = client_clone.get_connection().expect("Failed to connect to redis");
             let value: String = con.get(&params_clone.key).unwrap();
             info!("Node {} Sending redis update to {:?}", node_id_clone, client_info);
-            reqwest::Client::new()
+
+            let broadcast_id = uuid::Uuid::new_v4().to_string();
+
+            // Create a log record for the update operation
+            let log_record = LogInfo::new(
+                format!("node-{}", node_id_clone),
+                "".to_string(),
+                format!("Node {} broadcasting set key: {} = {}", node_id_clone, params_clone.key, value),
+                broadcast_id.clone()
+            );
+
+            let _ = push_log(log_record, &log_server_clone);
+
+            let response = reqwest::Client::new()
                 .post(format!("http://{}:6969/update", client_info.addr))
+                .header("Broadcast-Id", broadcast_id.clone())
                 .json(&json!({
                     "node": node_id_clone,
                     "key": params_clone.key,
                     "value": value
                 }))
                 .send()
-                .await
+                .await;
+
+            // Handle the Result to get the Response object
+            let response = match response {
+                Ok(res) => res,
+                Err(e) => {
+                    // Handle error appropriately, e.g., log or return an error
+                    eprintln!("Failed to send request: {}", e);
+                    return Err(e);
+                }
+            };
+
+            // Extracting the "Response-Id" from the response headers
+            let response_id = response
+                .headers()
+                .get("Message-Id")
+                .and_then(|header_value| header_value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            // Create a log record for the update operation
+            let log_record = LogInfo::new(
+                "".to_string(),
+                format!("node-{}", node_id_clone),
+                format!("Node {} received broadcast OK", node_id_clone),
+                response_id.clone()
+            );
+
+            let _ = push_log(log_record, &log_server_clone);
+
+            return Ok(response);
         }
     })
     .collect();
@@ -110,7 +158,7 @@ fn total_broadcast(node_id_clone: String, payload: Pair, client: redis::Client, 
 }
 
 
-fn push_log(log_record: LogInfo, log_server_url: &str) -> Result<(), reqwest::Error> {
+fn push_log(log_record: LogInfo, log_server_url: &String) -> Result<(), reqwest::Error> {
     let client = reqwest::blocking::Client::new();
     let json = serde_json::to_string(&log_record).expect("Failed to serialize log data");
 
@@ -127,7 +175,7 @@ async fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let master_url: String = env::var("MASTER_URL").expect("MASTER_URL must be set");
 
-    let log_server: String = env::var("LOG_SERVER_URL").expect("LOG_SERVER_URL must be set");
+    let log_server = env::var("LOG_SERVER_URL").expect("LOG_SERVER_URL must be set");
 
     let delay: u64 = env::var("DELAY").expect("DELAY must be set").parse().unwrap();
 
@@ -169,12 +217,14 @@ async fn main() {
         .and(warp::path("set"))
         .and(warp::header("Consistency-Model"))
         .and(warp::header("Client-Id"))
+        .and(warp::header("Message-Id"))
         .and(warp::body::json())
         .and(client_filter.clone())
-        .and_then(move |consistency_model: ConsistencyModel, client_id: String, payload: Pair, client: redis::Client| {
+        .and_then(move |consistency_model: ConsistencyModel, client_id: String, message_id: String, payload: Pair, client: redis::Client| {
             let cluster_addrs = cluster_addrs_clone.clone();
             let node_id_clone = node_id_clone.clone();
             let client_id_clone = client_id.clone();
+            let message_id_clone = message_id.clone();
             let log_server_clone = log_server_clone.clone();
             async move {
                 let mut con = client.get_connection().expect("Failed to connect to Redis");
@@ -185,44 +235,64 @@ async fn main() {
 
                 // Create a log record for the update operation
                 let log_record = LogInfo::new(
-                    format!("client-{}", client_id_clone),
+                    "".to_string(),
                     format!("node-{}", node_id_clone),
-                    format!("Client Set key: {}, value: {}", payload.key, payload.value)
+                    format!("Node {} received client {} set key: {} = {}", node_id_clone, client_id_clone, payload.key, payload.value),
+                    message_id_clone
                 );
 
                 let _ = push_log(log_record, &log_server_clone);
 
-                let duration = time::Duration::from_millis(delay * 0);
-                thread::sleep(duration);
+                let log_server_clone_clone = log_server_clone.clone();
 
                 match consistency_model {
                     ConsistencyModel::Strong => {
                         // For strong consistency, ensure all nodes are updated before responding
-                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone(), log_server_clone_clone);
+                        let duration = time::Duration::from_millis(delay);
+
+                        thread::sleep(duration);
                         futures::future::join_all(tasks).await;
+
                         info!("Strong consistency: All nodes updated.");
                     },
                     ConsistencyModel::Eventual => {
                         // For eventual consistency, respond immediately and update in the background
-                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone(), log_server_clone_clone);
+
                         tokio::spawn(async move {
+                            let duration = time::Duration::from_millis(delay);
+                            thread::sleep(duration);
+
                             futures::future::join_all(tasks).await;
                             info!("Eventual consistency: Nodes update initiated.");
                         });
+
+                        // Respond immediately
                     },
                     ConsistencyModel::Causal => {
                         // For causal consistency, updates depend on the causality chain, which might need custom logic
                         // Here, we just simulate a simple broadcast for demonstration
-                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone());
+                        let tasks = total_broadcast(node_id_clone.clone(), payload.clone(), client.clone(), cluster_addrs.clone(), log_server_clone_clone);
                         futures::future::join_all(tasks).await;
                         info!("Causal consistency: Causally ordered updates completed.");
                     },
                 }
 
-                // let tasks = total_broadcast(node_id_clone.clone(), payload, client, cluster_addrs);
-                // futures::future::join_all(tasks).await;
+                let response_id: String = uuid::Uuid::new_v4().to_string();
 
-                Ok::<_, warp::Rejection>(warp::reply::with_status("Key set", StatusCode::OK))
+                let log_record = LogInfo::new(
+                    format!("node-{}", node_id_clone),
+                    "".to_string(),
+                    "Node responding OK".to_string(),
+                    response_id.clone()
+                );
+
+                let _ = push_log(log_record, &log_server_clone);
+
+                let response = warp::reply::with_status("Key set", StatusCode::OK);
+                let custom_header = warp::reply::with_header(response, "Message-Id", response_id);
+                Ok::<_, warp::Rejection>(custom_header)
             }
         });
 
@@ -231,25 +301,41 @@ async fn main() {
 
     let update = warp::post()
         .and(warp::path("update"))
+        .and(warp::header("Broadcast-Id"))
         .and(warp::body::json())
         .and(client_filter.clone())
-        .map(move |payload: Broadcast, client: redis::Client| {
+        .map(move |broadcast_id: String, payload: Broadcast, client: redis::Client| {
             let mut con = client.get_connection().expect("Failed to connect to Redis");
+
+            // Create a log record for the update operation
+            let log_record = LogInfo::new(
+                "".to_string(),
+                format!("node-{}", node_id_clone),
+                format!("Node {} received broadcast to set key: {} = {}", node_id_clone, payload.key, payload.value),
+                broadcast_id.clone()
+            );
+
+            let _ = push_log(log_record, &log_server_clone.clone());
 
             let _: () = con.set(&payload.key, &payload.value).expect("Failed to set key in Redis");
 
             info!("Node {}: update key {} = {}", node_id_clone.clone(), payload.key, payload.value);
 
+            let response_id: String = uuid::Uuid::new_v4().to_string();
+
             // Create a log record for the update operation
             let log_record = LogInfo::new(
-                format!("node-{}", payload.node.clone()),
-                format!("node-{}", node_id_clone.clone()),
-                format!("Broadcast Set key: {}, value: {}", payload.key, payload.value)
+                format!("node-{}", node_id_clone),
+                "".to_string(),
+                format!("Node {} responding OK", node_id_clone),
+                response_id.clone()
             );
 
             let _ = push_log(log_record, &log_server_clone.clone());
 
-            warp::reply::with_status("Key set", StatusCode::OK)
+            let response = warp::reply::with_status("Key set", StatusCode::OK);
+            let custom_header = warp::reply::with_header(response, "Message-Id", response_id);
+            custom_header
         });
 
     let node_id_clone = node_id.clone();
@@ -259,23 +345,45 @@ async fn main() {
         .and(warp::path("get"))
         .and(warp::header("Client-Id"))
         .and(warp::path::param())
+        .and(warp::header("Message-Id"))
         .and(client_filter.clone()) // Clone the client filter for use in this route
-        .map(move |client_id: String, key: String, client: redis::Client| {
+        .map(move |client_id: String, key: String, message_id: String, client: redis::Client| {
+             // Create a log record for the update operation
+             let log_record = LogInfo::new(
+                "".to_string(),
+                format!("node-{}", node_id_clone),
+                format!("Node {} receiving client {} aks for key {}", node_id_clone, client_id, key),
+                message_id.clone()
+            );
+
+            let _ = push_log(log_record, &log_server_clone.clone());
+
             let mut con = client.get_connection().expect("failed to connect to Redis");
             match con.get(&key) {
                 Ok(value) => {
+                    let response_id: String = uuid::Uuid::new_v4().to_string();
+
                     // Create a log record for the update operation
                     let log_record = LogInfo::new(
-                        format!("client-{}", client_id.clone()),
-                        format!("node-{}", node_id_clone.clone()),
-                        format!("Client Got key: {}, value: {}", key, value)
+                        format!("node-{}", node_id_clone),
+                        "".to_string(),
+                        format!("Node {} responding with key {} = {}", node_id_clone, key, value),
+                        response_id.clone()
                     );
 
                     let _ = push_log(log_record, &log_server_clone.clone());
 
-                    warp::reply::with_status(warp::reply::json::<String>(&value), StatusCode::OK)
+                    let response = warp::reply::with_status(warp::reply::json::<String>(&value), StatusCode::OK);
+                    let custom_header = warp::reply::with_header(response, "Message-Id", response_id);
+                    custom_header
                 }
-                Err(_) => warp::reply::with_status(warp::reply::json(&"key not found"), StatusCode::NOT_FOUND)
+                Err(_) => {
+                    let response_id: String = uuid::Uuid::new_v4().to_string();
+
+                    let response = warp::reply::with_status(warp::reply::json::<String>(&"key not found".to_string()), StatusCode::NOT_FOUND);
+                    let custom_header = warp::reply::with_header(response, "Message-Id", response_id);
+                    custom_header
+                }
             }
         });
 

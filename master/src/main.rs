@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap; // Added this line to import HashMap
 use reqwest;
+use std::env;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,10 +52,12 @@ async fn main() {
 
     info!("Master running on port 3000");
 
+    let inverval: u64 = env::var("INTERVAL").expect("INTERVAL must be set").parse().unwrap();
+
     // Start the health checker
     let health_check_db = db.clone();
     tokio::spawn(async move {
-        health_checker(health_check_db, 30).await; // Check every 30 seconds
+        health_checker(health_check_db, inverval).await; // Check every 30 seconds
     });
 
     let routes = register;
