@@ -12,7 +12,7 @@ services:
       LOG_SERVER_URL: http://log-app:8000/log/
       DELAY: 200
     deploy:
-      replicas: 2
+      replicas: 3
     depends_on:
       - master-app
     healthcheck:
@@ -40,14 +40,13 @@ services:
 
   visualization-app:
     image: visualization-app:latest
-    environment:
-      - LOG_SERVER_URL=http://log-app:8000/logs/
     ports: 
       - "8080:8080"
     networks:
       - db-node-network
     volumes:
       - ./visualization/plot.js:/app/plot.js:ro
+      - ./visualization/index.html:/app/index.html:ro
 
 networks:
   db-node-network:

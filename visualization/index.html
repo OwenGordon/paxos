@@ -6,7 +6,8 @@
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
-<div id="plotDiv" style="width:100%;height:100%;"></div>
-<script src="plot.js"></script> <!-- Path to your JavaScript file -->
+    <button onclick="fetch('http://localhost:8000/logs/', {method: 'DELETE'})">Delete Logs</button>
+    <div id="plotDiv" style="width:100%;height:100%;"></div>
+    <script src="plot.js"></script> <!-- Path to your JavaScript file -->
 </body>
 </html>

@@ -1,7 +1,6 @@
 data = fetch("http://localhost:8000/logs/")
     .then(response => response.json())
-    .then(json => { 
-
+    .then(json => {
         colors = [
             '#1f77b4',  // muted blue
             '#ff7f0e',  // safety orange
@@ -32,6 +31,7 @@ data = fetch("http://localhost:8000/logs/")
         for (var message_id in messages) {
             let sender = messages[message_id][0]
             let receiver = messages[message_id][1]
+
             data.push({
                 source: sender.sender,
                 destination: receiver.receiver,
@@ -63,11 +63,20 @@ data = fetch("http://localhost:8000/logs/")
             positions[item] = index + 1;
         });
 
+        // Determine the min and max timestamps
+        let times = data.flatMap(entry => [new Date(entry.send_timestamp), new Date(entry.recv_timestamp)]);
+        let minTime = new Date(Math.min(...times));
+        let maxTime = new Date(Math.max(...times));
+        // let timeExtension = (maxTime - minTime) * 0.05; // 15% of the time span
+
+        // minTime = new Date(minTime.getTime() - timeExtension);
+        // maxTime = new Date(maxTime.getTime() + timeExtension);
+
         // Prepare traces for the plot
         let traces = [];
-        let annotations = [];
 
-        data.forEach((entry, i) => {
+        data.forEach((entry, _) => {
+            
             let startTime = new Date(entry.send_timestamp);
             let endTime = new Date(entry.recv_timestamp);
             let startY = positions[entry.source];
@@ -90,7 +99,7 @@ data = fetch("http://localhost:8000/logs/")
             }
 
             traces.push({
-                x: [startTime, endTime], // Start and end time for the arrow
+                x: [new Date(startTime.getTime() - minTime), new Date(endTime.getTime() - minTime)], // Start and end time for the arrow
                 y: [startY, endY], // Source and destination positions
                 mode: 'lines+markers',
                 type: 'scattergl',  // Use scattergl for better performance and line hover
@@ -102,21 +111,14 @@ data = fetch("http://localhost:8000/logs/")
             });            
         })
 
-        // Determine the min and max timestamps
-        let times = data.map(entry => new Date(entry.timestamp));
-        let minTime = new Date(Math.min(...times));
-        let maxTime = new Date(Math.max(...times));
-        let timeExtension = (maxTime - minTime) * 0.15; // 15% of the time span
-
-        minTime = new Date(minTime.getTime() - timeExtension);
-        maxTime = new Date(maxTime.getTime() + timeExtension);
+        let duration = new Date(maxTime - minTime);
         // Layout configuration
         let layout = {
             title: 'Event Timing Diagram',
             xaxis: {
                 title: 'Time',
-                tickformat: '%H:%M:%S',
-                range: [minTime, maxTime]
+                tickformat: '%S.%f',
+                range: [0, duration]
             },
             yaxis: {
                 title: 'Nodes',
@@ -125,7 +127,6 @@ data = fetch("http://localhost:8000/logs/")
             },
             showlegend: false,
             hovermode: 'closest', // Only the closest data point's hover info is displayed
-            annotations: annotations
         };
 
         // Render the plot
